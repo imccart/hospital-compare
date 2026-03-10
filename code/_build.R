@@ -13,8 +13,8 @@ source("code/0-setup.R")
 
 # Call individual code files ----------------------------------------------
 
-# source("code/1-api-current.R")
-# source("code/2-nber-legacy.R")
-# source("code/3-merge.R")
+source("code/1-api-current.R")
+source("code/2-nber-legacy.R")
+source("code/3-build-panels.R")
 
 message("Build complete.")
