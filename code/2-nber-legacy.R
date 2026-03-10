@@ -2,9 +2,13 @@
 
 ## Author:        Ian McCarthy
 ## Date Created:  2026-03-10
+## Date Edited:   2026-03-10
 ## Description:   Parse NBER legacy Hospital Compare archives (nber-YYYYMM/).
-##                Handles evolving file names and column structures across
-##                20 years of monthly releases (2005-2025).
+##                Handles three naming eras plus zipped archives:
+##                  Era 1 (2005-2014):  vwhqi_hosp.csv / dbo_vwhqi_hosp.csv
+##                  Era 2 (2014-2016):  hqi_hosp.csv
+##                  Era 3 (2015-2016):  hospital_general_information.csv (CMS-style)
+##                  Zipped (2017-2025): hospitals_compare_YYYYMM.zip -> CMS-style names
 ##                Outputs: one CSV per topic area, stacked across all vintages.
 
 
@@ -17,6 +21,31 @@ nber_dirs <- sort(nber_dirs)
 if (length(nber_dirs) == 0) stop("No nber-YYYYMM folders found in data/input/hospitals/")
 
 message(length(nber_dirs), " NBER vintage folders found")
+
+
+# =========================================================================
+# Step 0: Unzip any folders that only contain a .zip file
+# =========================================================================
+
+message("\n=== Checking for zipped vintages ===")
+n_unzipped <- 0
+
+for (d in nber_dirs) {
+  zip_files <- list.files(d, pattern = "\\.zip$", full.names = TRUE)
+  csv_files <- list.files(d, pattern = "\\.csv$", full.names = TRUE)
+
+  # Only unzip if there are zip(s) but no CSVs yet
+
+  if (length(zip_files) > 0 && length(csv_files) == 0) {
+    for (zf in zip_files) {
+      message("  Extracting: ", basename(d), "/", basename(zf))
+      unzip(zf, exdir = d, overwrite = FALSE)
+      n_unzipped <- n_unzipped + 1
+    }
+  }
+}
+
+message("Extracted ", n_unzipped, " zip archives")
 
 
 # Helper: find file by pattern --------------------------------------------
@@ -34,19 +63,57 @@ find_file <- function(dir, patterns) {
 # Helper: safe read -------------------------------------------------------
 
 safe_read <- function(file) {
-  tryCatch(
+  df <- tryCatch(
     fread(file, colClasses = "character", encoding = "UTF-8"),
     error = function(e) {
-      # Try Latin1 encoding for older files
       tryCatch(
         fread(file, colClasses = "character", encoding = "Latin-1"),
         error = function(e2) {
-          message("    Failed to read: ", basename(file), " — ", e2$message)
+          message("    Failed to read: ", basename(file), " -- ", e2$message)
           return(NULL)
         }
       )
     }
   )
+  if (!is.null(df)) df <- scrub_encoding(df)
+  df
+}
+
+
+# Helper: standardize column names ----------------------------------------
+
+standardize_names <- function(df) {
+  nms <- tolower(names(df))
+  nms <- gsub("[^a-z0-9]+", "_", nms)
+  nms <- gsub("^_|_$", "", nms)
+  names(df) <- nms
+  df
+}
+
+
+# Helper: scrub invalid UTF-8 from character columns ----------------------
+
+scrub_encoding <- function(df) {
+  chr_cols <- names(df)[sapply(df, is.character)]
+  for (col in chr_cols) {
+    df[[col]] <- iconv(df[[col]], from = "", to = "UTF-8", sub = "")
+  }
+  df
+}
+
+
+# Helper: rename columns via map, respecting existing targets -------------
+
+apply_col_map <- function(df, col_map) {
+  for (old_name in names(col_map)) {
+    if (old_name %in% names(df)) {
+      target <- col_map[old_name]
+      if (!(target %in% names(df)) || old_name == target) {
+        names(df)[names(df) == old_name] <- target
+      }
+    }
+  }
+  df
 }
 
 
@@ -64,8 +131,9 @@ for (d in nber_dirs) {
   f <- find_file(d, c(
     "^dbo_vwhqi_hosp\\.csv$",
     "^vwhqi_hosp\\.csv$",
-    "^Hospital_General_Information",
-    "^Hospital General Information"
+    "^hqi_hosp\\.csv$",
+    "^hospital_general_information\\.csv$",
+    "^Hospital General Information\\.csv$"
   ))
 
   if (is.null(f)) next
@@ -73,57 +141,38 @@ for (d in nber_dirs) {
   df <- safe_read(f)
   if (is.null(df) || nrow(df) == 0) next
 
-  # Standardize key columns across eras
-  names(df) <- tolower(names(df)) %>%
-    str_replace_all("[^a-z0-9]+", "_") %>%
-    str_replace_all("^_|_$", "")
+  df <- standardize_names(df)
 
-  # Map varying column names to standard names
   col_map <- c(
-    # Facility ID
     "provider" = "facility_id",
     "provider_id" = "facility_id",
     "facility_id" = "facility_id",
     "prvdr_id" = "facility_id",
-    # Name
     "hospname" = "facility_name",
     "hospital_name" = "facility_name",
     "facility_name" = "facility_name",
-    # State
     "state" = "state",
-    # City
     "city" = "city",
     "city_town" = "city",
-    # ZIP
     "zipcode" = "zip_code",
     "zip_code" = "zip_code",
-    # County
     "countyname" = "county",
     "county_parish" = "county",
+    "county_name" = "county",
     "county" = "county",
-    # Type
     "hospitaltype" = "hospital_type",
     "hospital_type" = "hospital_type",
-    # Ownership
     "hospitalowner" = "hospital_ownership",
     "hospitalownership" = "hospital_ownership",
     "hospital_ownership" = "hospital_ownership",
     "ownership" = "hospital_ownership",
-    # Emergency
     "emergencyservice" = "emergency_services",
     "emergency_services" = "emergency_services",
-    # Overall rating (newer files)
     "hospital_overall_rating" = "overall_rating"
   )
 
-  # Rename columns that exist
-  for (old_name in names(col_map)) {
-    if (old_name %in% names(df)) {
-      names(df)[names(df) == old_name] <- col_map[old_name]
-    }
-  }
+  df <- apply_col_map(df, col_map)
 
-  # Keep only standardized columns that exist
   keep_cols <- c("facility_id", "facility_name", "state", "city", "zip_code",
                  "county", "hospital_type", "hospital_ownership",
                  "emergency_services", "overall_rating")
@@ -137,11 +186,8 @@ for (d in nber_dirs) {
 
 if (length(hosp_info_list) > 0) {
   hosp_info <- rbindlist(hosp_info_list, fill = TRUE)
-
-  # Clean whitespace
   chr_cols <- names(hosp_info)[sapply(hosp_info, is.character)]
   hosp_info[, (chr_cols) := lapply(.SD, trimws), .SDcols = chr_cols]
-
   fwrite(hosp_info, "data/output/nber_hospital_info.csv")
   message("Wrote nber_hospital_info.csv: ", nrow(hosp_info), " rows, ",
           uniqueN(hosp_info$vintage), " vintages, ",
@@ -165,8 +211,9 @@ for (d in nber_dirs) {
   f <- find_file(d, c(
     "^dbo_vwhqi_hosp_msr_xwlk\\.csv$",
     "^vwhqi_hosp_msr_xwlk\\.csv$",
+    "^hqi_hosp_timelyeffectivecare\\.csv$",
     "^Timely_and_Effective_Care-Hospital",
-    "^Timely and Effective Care"
+    "^Timely and Effective Care - Hospital"
   ))
 
   if (is.null(f)) next
@@ -174,9 +221,7 @@ for (d in nber_dirs) {
   df <- safe_read(f)
   if (is.null(df) || nrow(df) == 0) next
 
-  names(df) <- tolower(names(df)) %>%
-    str_replace_all("[^a-z0-9]+", "_") %>%
-    str_replace_all("^_|_$", "")
+  df <- standardize_names(df)
 
   col_map <- c(
     "provider" = "facility_id",
@@ -202,15 +247,7 @@ for (d in nber_dirs) {
     "end_date" = "end_date"
   )
 
-  for (old_name in names(col_map)) {
-    if (old_name %in% names(df)) {
-      # Don't overwrite if target already exists (e.g., score vs scorestr)
-      target <- col_map[old_name]
-      if (!(target %in% names(df)) || old_name == target) {
-        names(df)[names(df) == old_name] <- target
-      }
-    }
-  }
+  df <- apply_col_map(df, col_map)
 
   keep_cols <- c("facility_id", "facility_name", "state", "condition",
                  "measure_id", "measure_name", "score", "sample",
@@ -249,9 +286,10 @@ for (d in nber_dirs) {
   f <- find_file(d, c(
     "^dbo_vwhqi_hosp_hcahps_msr\\.csv$",
     "^vwhqi_hosp_hcahps_msr\\.csv$",
+    "^hqi_hosp_hcahps\\.csv$",
+    "^hcahps___hospital\\.csv$",
     "^HCAHPS-Hospital",
-    "^HCAHPS - Hospital",
-    "hcahps.*hospital"
+    "^HCAHPS - Hospital"
   ))
 
   if (is.null(f)) next
@@ -259,9 +297,7 @@ for (d in nber_dirs) {
   df <- safe_read(f)
   if (is.null(df) || nrow(df) == 0) next
 
-  names(df) <- tolower(names(df)) %>%
-    str_replace_all("[^a-z0-9]+", "_") %>%
-    str_replace_all("^_|_$", "")
+  df <- standardize_names(df)
 
   col_map <- c(
     "provider" = "facility_id",
@@ -290,14 +326,7 @@ for (d in nber_dirs) {
     "end_date" = "end_date"
   )
 
-  for (old_name in names(col_map)) {
-    if (old_name %in% names(df)) {
-      target <- col_map[old_name]
-      if (!(target %in% names(df)) || old_name == target) {
-        names(df)[names(df) == old_name] <- target
-      }
-    }
-  }
+  df <- apply_col_map(df, col_map)
 
   keep_cols <- c("facility_id", "facility_name", "state",
                  "hcahps_measure_id", "hcahps_question",
@@ -336,14 +365,16 @@ mort_readm_list <- list()
 for (d in nber_dirs) {
   vintage <- str_extract(basename(d), "\\d{6}")
 
-  # Try complications/deaths first, then legacy mortality file
   f <- find_file(d, c(
     "^dbo_vwhqi_hosp_mortality_readm_xwlk\\.csv$",
+    "^dbo_vwhqi_hosp_mortality_xwlk\\.csv$",
     "^vwhqi_hosp_mortality_readm_xwlk\\.csv$",
+    "^hqi_hosp_readmcompdeath\\.csv$",
+    "^hqi_hosp_readmdeath\\.csv$",
+    "^hqi_hosp_mv\\.csv$",
+    "^complications___hospital\\.csv$",
     "^Complications_and_Deaths-Hospital",
-    "^Complications and Deaths",
-    "mortality.*readm",
-    "death.*readm"
+    "^Complications and Deaths - Hospital"
   ))
 
   if (is.null(f)) next
@@ -351,9 +382,7 @@ for (d in nber_dirs) {
   df <- safe_read(f)
   if (is.null(df) || nrow(df) == 0) next
 
-  names(df) <- tolower(names(df)) %>%
-    str_replace_all("[^a-z0-9]+", "_") %>%
-    str_replace_all("^_|_$", "")
+  df <- standardize_names(df)
 
   col_map <- c(
     "provider" = "facility_id",
@@ -373,6 +402,7 @@ for (d in nber_dirs) {
     "compared_to_national" = "compared_to_national",
     "denominator" = "denominator",
     "score" = "score",
+    "scr" = "score",
     "lower_estimate" = "lower_estimate",
     "higher_estimate" = "higher_estimate",
     "footnote" = "footnote",
@@ -380,14 +410,7 @@ for (d in nber_dirs) {
     "end_date" = "end_date"
   )
 
-  for (old_name in names(col_map)) {
-    if (old_name %in% names(df)) {
-      target <- col_map[old_name]
-      if (!(target %in% names(df)) || old_name == target) {
-        names(df)[names(df) == old_name] <- target
-      }
-    }
-  }
+  df <- apply_col_map(df, col_map)
 
   keep_cols <- c("facility_id", "facility_name", "state", "condition",
                  "measure_id", "measure_name", "compared_to_national",
@@ -425,11 +448,12 @@ for (d in nber_dirs) {
   vintage <- str_extract(basename(d), "\\d{6}")
 
   f <- find_file(d, c(
-    "^vwhqi_hosp_hai\\.csv$",
     "^dbo_vwhqi_hosp_hai\\.csv$",
+    "^vwhqi_hosp_hai\\.csv$",
+    "^hqi_hosp_hai\\.csv$",
+    "^healthcare_associated_infections___hospital\\.csv$",
     "^Healthcare_Associated_Infections-Hospital",
-    "^Healthcare Associated Infections",
-    "hai.*hospital"
+    "^Healthcare Associated Infections - Hospital"
   ))
 
   if (is.null(f)) next
@@ -437,9 +461,7 @@ for (d in nber_dirs) {
   df <- safe_read(f)
   if (is.null(df) || nrow(df) == 0) next
 
-  names(df) <- tolower(names(df)) %>%
-    str_replace_all("[^a-z0-9]+", "_") %>%
-    str_replace_all("^_|_$", "")
+  df <- standardize_names(df)
 
   col_map <- c(
     "provider" = "facility_id",
@@ -463,14 +485,7 @@ for (d in nber_dirs) {
     "end_date" = "end_date"
   )
 
-  for (old_name in names(col_map)) {
-    if (old_name %in% names(df)) {
-      target <- col_map[old_name]
-      if (!(target %in% names(df)) || old_name == target) {
-        names(df)[names(df) == old_name] <- target
-      }
-    }
-  }
+  df <- apply_col_map(df, col_map)
 
   keep_cols <- c("facility_id", "facility_name", "state",
                  "measure_id", "measure_name", "compared_to_national",
